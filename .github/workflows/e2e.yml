@@ -1,0 +1,166 @@
+name: E2E
+
+# End-to-end tests (e2e/), including the full VPN on every platform. Called by the Build
+# workflow for v* tags (a release is only published when these pass); can also be run by hand.
+# Hosted runners are admin without a password, so the VPN tests run without an OS prompt:
+# UAC auto-approves on Windows, and on macOS/Linux the tests run as root (sudo).
+
+on:
+  workflow_call:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  DX_VERSION: 0.7.10
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            e2e
+      - name: Build app and tests
+        run: |
+          cargo build --release --locked
+          cargo build --locked --manifest-path e2e/Cargo.toml
+      - name: SSH tunnel + SOCKS
+        run: e2e/target/debug/e2e.exe tunnel
+      - name: System proxy fallback
+        run: e2e/target/debug/e2e.exe proxy
+      - name: Full VPN (Wintun)
+        run: e2e/target/debug/e2e.exe vpn full
+      - name: Full VPN, app crashes while connected
+        run: |
+          e2e/target/debug/e2e.exe vpn crash
+          Start-Sleep -Seconds 8
+          $route = Get-NetRoute -AddressFamily IPv4 -DestinationPrefix 0.0.0.0/0 | Sort-Object RouteMetric | Select-Object -First 1
+          Write-Output "default route after crash: $($route.InterfaceAlias) -> $($route.NextHop)"
+          if ($route.InterfaceAlias -eq 'wintun') { throw 'default route still points at the tunnel' }
+          if (Get-Process e2e -ErrorAction SilentlyContinue) { throw 'VPN helper is still running' }
+          curl.exe -sf -m 15 -o NUL https://example.com
+          if ($LASTEXITCODE -ne 0) { throw 'no internet after the crash' }
+      - name: Helper log
+        if: always()
+        run: Get-Content "$env:TEMP\ssh-vpn-e2e-helper.log" -Tail 40 -ErrorAction SilentlyContinue
+      - name: App window starts (WebView2)
+        run: |
+          $p = Start-Process target/release/ssh-vpn.exe -PassThru
+          Start-Sleep -Seconds 15
+          if ($p.HasExited) { throw "ssh-vpn.exe exited with code $($p.ExitCode)" }
+          Stop-Process -Id $p.Id
+
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: e2e
+      - run: cargo build --locked --manifest-path e2e/Cargo.toml
+      - name: SSH tunnel + SOCKS
+        run: e2e/target/debug/e2e tunnel
+      - name: System proxy fallback
+        run: sudo e2e/target/debug/e2e proxy
+      - name: Full VPN (utun)
+        run: sudo e2e/target/debug/e2e vpn full
+      - name: Full VPN, app crashes while connected
+        run: |
+          sudo e2e/target/debug/e2e vpn crash || true
+          sleep 8
+          route -n get default
+          if route -n get default | grep -q utun; then echo "default route still points at the tunnel"; exit 1; fi
+          if pgrep -f -- --tun-helper; then echo "VPN helper is still running"; exit 1; fi
+          curl -sf -m 15 -o /dev/null https://example.com
+      - name: Helper log
+        if: always()
+        run: sudo sh -c 'tail -40 "$TMPDIR/ssh-vpn-e2e-helper.log" /tmp/ssh-vpn-e2e-helper.log 2>/dev/null' || true
+
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: e2e
+      - run: cargo build --locked --manifest-path e2e/Cargo.toml
+      - name: SSH tunnel + SOCKS
+        run: e2e/target/debug/e2e tunnel
+      - name: Full VPN (tun)
+        run: sudo e2e/target/debug/e2e vpn full
+      - name: Full VPN, app crashes while connected
+        run: |
+          sudo e2e/target/debug/e2e vpn crash || true
+          sleep 8
+          ip -4 route
+          if ip -4 route | grep -q tun0; then echo "tunnel routes left behind"; exit 1; fi
+          if pgrep -f -- --tun-helper; then echo "VPN helper is still running"; exit 1; fi
+          curl -sf -m 15 -o /dev/null https://example.com
+      - name: Helper log
+        if: always()
+        run: sudo tail -40 /tmp/ssh-vpn-e2e-helper.log || true
+
+  android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Enable KVM for the emulator
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          # The emulator is x86_64; the shipped APK is arm64 but built from the same code.
+          targets: x86_64-linux-android
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            e2e
+      - uses: cargo-bins/cargo-binstall@main
+      - run: cargo binstall -y --force dioxus-cli@${{ env.DX_VERSION }}
+      - name: Use preinstalled NDK
+        run: echo "ANDROID_NDK_HOME=$ANDROID_NDK_LATEST_HOME" >> "$GITHUB_ENV"
+      - name: Build APK (x86_64, throwaway signing key)
+        run: |
+          dx bundle --android --release --target x86_64-linux-android \
+            --features mobile --no-default-features --out-dir bundle
+          keytool -genkeypair -keystore test.jks -storepass testpass -keypass testpass -alias key \
+            -keyalg RSA -keysize 2048 -validity 1000 -dname "CN=ssh-vpn e2e"
+          curl -sSL -o bundletool.jar https://github.com/google/bundletool/releases/download/1.17.2/bundletool-all-1.17.2.jar
+          java -jar bundletool.jar build-apks --bundle="$(find bundle -name '*.aab' | head -n1)" \
+            --output=app.apks --mode=universal --ks=test.jks --ks-pass=pass:testpass \
+            --ks-key-alias=key --key-pass=pass:testpass
+          unzip -p app.apks universal.apk > app.apk
+      - run: cargo build --locked --manifest-path e2e/Cargo.toml
+      - name: Emulator test
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 34
+          target: google_apis
+          arch: x86_64
+          profile: pixel_6
+          # The runner has 4 vCPUs; with the default 2 the launcher keeps hanging after boot.
+          cores: 4
+          ram-size: 4096M
+          disable-animations: true
+          emulator-options: -no-snapshot -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim
+          script: bash e2e/android.sh app.apk e2e/target/debug/e2e
+      - name: Upload screenshot and logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-e2e-failure
+          path: e2e-android/
+          if-no-files-found: ignore

@@ -1,0 +1,47 @@
+[package]
+name = "ssh-vpn"
+version = "0.1.0"
+edition = "2021"
+description = "Use an SSH server as a VPN: full-device VPN (TUN) with system proxy fallback"
+
+[dependencies]
+dioxus = "0.7"
+# ring instead of the default aws-lc-rs: no cmake/NDK C build needed when targeting Android.
+russh = { version = "0.64", default-features = false, features = ["ring", "rsa", "flate2"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "process", "signal"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+directories = "6"
+anyhow = "1"
+open = "5"
+tun2proxy = { version = "0.8", default-features = false }
+
+[features]
+default = ["desktop"]
+desktop = ["dioxus/desktop"]
+mobile = ["dioxus/mobile"]
+
+[target.'cfg(target_os = "android")'.dependencies]
+jni = "0.21"
+ndk-context = "0.1"
+android_logger = "0.15"
+log = "0.4"
+
+# Full-device VPN on desktop (see src/vpn.rs).
+[target.'cfg(not(target_os = "android"))'.dependencies]
+tun = { version = "0.8", features = ["async"] }
+tproxy-config = { version = "7", default-features = false }
+
+[target.'cfg(windows)'.dependencies]
+winreg = "0.56"
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Networking_WinInet",
+    "Win32_System_Registry",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[profile.release]
+opt-level = "s"
+lto = true

@@ -1,0 +1,172 @@
+name: Build
+
+on:
+  push:
+    branches: [main, master]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  DX_VERSION: 0.7.10
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --locked
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory out | Out-Null
+          Copy-Item target/release/ssh-vpn.exe out/ssh-vpn-windows-x64.exe
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-x64
+          path: out/*
+
+  linux:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install system libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libxdo-dev \
+            libayatana-appindicator3-dev librsvg2-dev libssl-dev pkg-config
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --locked
+      - name: Package
+        run: |
+          mkdir out
+          tar -czf out/ssh-vpn-linux-x64.tar.gz -C target/release ssh-vpn
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-x64
+          path: out/*
+
+  macos:
+    runs-on: macos-latest
+    strategy:
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            arch: arm64
+          - target: x86_64-apple-darwin
+            arch: x64
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - uses: cargo-bins/cargo-binstall@main
+      # Pin dx to the runner's own arch: in the x86_64 leg binstall picked the Intel build,
+      # which runs under Rosetta and fails on the missing Intel Homebrew OpenSSL.
+      - run: >
+          cargo binstall -y --force --targets "$(rustc -vV | sed -n 's/^host: //p')"
+          dioxus-cli@${{ env.DX_VERSION }}
+      - run: dx bundle --desktop --release --target ${{ matrix.target }} --package-types macos --out-dir bundle
+      # Signed with a Developer ID and notarized when the secrets are set, ad-hoc otherwise
+      # (see scripts/macos-dmg.sh).
+      - name: Sign and package
+        env:
+          CERT_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
+          CERT_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: |
+          if [ -n "$CERT_BASE64" ]; then
+            KC=$RUNNER_TEMP/sign.keychain-db
+            security create-keychain -p ci "$KC"
+            security set-keychain-settings "$KC"
+            security unlock-keychain -p ci "$KC"
+            echo "$CERT_BASE64" | base64 -d > "$RUNNER_TEMP/cert.p12"
+            security import "$RUNNER_TEMP/cert.p12" -k "$KC" -P "$CERT_PASSWORD" -T /usr/bin/codesign
+            security set-key-partition-list -S apple-tool:,apple: -s -k ci "$KC" >/dev/null
+            security list-keychains -d user -s "$KC"
+            export MACOS_SIGN_IDENTITY=$(security find-identity -v -p codesigning "$KC" | grep -o '"Developer ID Application[^"]*"' | head -1 | tr -d '"')
+          else
+            echo "::warning::MACOS_CERTIFICATE_P12_BASE64 is not set; the app is signed ad-hoc and users must allow it in System Settings > Privacy & Security on first launch"
+          fi
+          mkdir out
+          scripts/macos-dmg.sh bundle/SshVpn.app out/ssh-vpn-macos-${{ matrix.arch }}.dmg
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-${{ matrix.arch }}
+          path: out/*
+
+  android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+      - uses: Swatinem/rust-cache@v2
+      - uses: cargo-bins/cargo-binstall@main
+      - run: cargo binstall -y --force dioxus-cli@${{ env.DX_VERSION }}
+      - name: Use preinstalled NDK
+        run: echo "ANDROID_NDK_HOME=$ANDROID_NDK_LATEST_HOME" >> "$GITHUB_ENV"
+      # Release builds come out as an .aab; dx's own apk output is the debuggable variant.
+      - run: >
+          dx bundle --android --release --target aarch64-linux-android
+          --features mobile --no-default-features --out-dir bundle
+      - name: Build signed universal APK
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          if [ -n "$KEYSTORE_BASE64" ]; then
+            echo "$KEYSTORE_BASE64" | base64 -d > release.jks
+          else
+            echo "::warning::ANDROID_KEYSTORE_BASE64 is not set; signing with a throwaway key, so this APK cannot update a previous install"
+            KEYSTORE_PASSWORD=throwaway KEY_ALIAS=key KEY_PASSWORD=throwaway
+            keytool -genkeypair -keystore release.jks -storepass "$KEYSTORE_PASSWORD" -keypass "$KEY_PASSWORD" \
+              -alias "$KEY_ALIAS" -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=ssh-vpn"
+          fi
+          curl -sSL -o bundletool.jar https://github.com/google/bundletool/releases/download/1.17.2/bundletool-all-1.17.2.jar
+          java -jar bundletool.jar build-apks --bundle="$(find bundle -name '*.aab' | head -n1)" \
+            --output=app.apks --mode=universal --ks=release.jks --ks-pass="pass:$KEYSTORE_PASSWORD" \
+            --ks-key-alias="$KEY_ALIAS" --key-pass="pass:$KEY_PASSWORD"
+          mkdir out
+          unzip -p app.apks universal.apk > out/ssh-vpn-android-arm64.apk
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android-arm64
+          path: out/*
+
+  # Release tags must also pass the end-to-end tests on every platform.
+  e2e:
+    if: startsWith(github.ref, 'refs/tags/v')
+    uses: ./.github/workflows/e2e.yml
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [windows, linux, macos, android, e2e]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: out
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: out/*
+          generate_release_notes: true
