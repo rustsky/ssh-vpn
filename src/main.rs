@@ -26,6 +26,10 @@ use tunnel::Tunnel;
 const REPO_URL: &str = "https://github.com/omidmousavi/csharp-ssh-vpn";
 const CSS: &str = include_str!("style.css");
 
+/// How long to keep trying to get a dropped SSH connection back before giving up. Until then
+/// the VPN stays up, so traffic waits instead of leaking past the tunnel.
+const RECONNECT_FOR: Duration = Duration::from_secs(120);
+
 /// Whether we changed the system proxy, so it can be restored on any exit path.
 static PROXY_ACTIVE: AtomicBool = AtomicBool::new(false);
 
@@ -81,6 +85,8 @@ enum Status {
     Disconnected,
     Connecting,
     Connected,
+    /// The SSH connection dropped and is being re-established; routing stays in place.
+    Reconnecting,
     Disconnecting,
 }
 
@@ -227,6 +233,43 @@ fn App() -> Element {
         status.set(Status::Connected);
     };
 
+    // The SSH session dropped (network change, phone asleep, server restart): connect again
+    // behind the same SOCKS port, which the VPN or system proxy still points at.
+    let reconnect = move || async move {
+        let Some(old) = tunnel.write().take() else { return };
+        let server_ip = old.server_ip();
+        old.stop().await;
+        status.set(Status::Reconnecting);
+        let cfg = Settings::load();
+        let deadline = Instant::now() + RECONNECT_FOR;
+        let mut delay = 1;
+        loop {
+            let result = Tunnel::reconnect(&cfg, server_ip).await;
+            // The user may have disconnected in the meantime.
+            if *status.peek() != Status::Reconnecting {
+                if let Ok(t) = result {
+                    t.stop().await;
+                }
+                return;
+            }
+            match result {
+                Ok(t) => {
+                    tunnel.set(Some(t));
+                    status.set(Status::Connected);
+                    return;
+                }
+                Err(e) if Instant::now() >= deadline => {
+                    disconnect().await;
+                    message("Disconnected", format!("The SSH connection was lost and could not be restored: {e:#}"), true);
+                    return;
+                }
+                Err(_) => {}
+            }
+            tokio::time::sleep(Duration::from_secs(delay)).await;
+            delay = (delay * 2).min(15);
+        }
+    };
+
     // Status timer: update the clock and notice dropped connections.
     use_future(move || async move {
         loop {
@@ -252,8 +295,7 @@ fn App() -> Element {
                     elapsed.set(t.elapsed().as_secs());
                 }
             } else {
-                disconnect().await;
-                message("Disconnected", "The SSH connection was lost.".into(), true);
+                reconnect().await;
             }
         }
     });
@@ -280,6 +322,7 @@ fn App() -> Element {
         Status::Disconnected => ("off", "Not connected"),
         Status::Connecting => ("busy", "Connecting…"),
         Status::Connected => ("on", "Connected"),
+        Status::Reconnecting => ("busy", "Reconnecting…"),
         Status::Disconnecting => ("busy", "Disconnecting…"),
     };
     let detail = match st {
@@ -288,6 +331,7 @@ fn App() -> Element {
             format!("{:02}:{:02}:{:02}", s / 3600, (s % 3600) / 60, s % 60)
         }
         Status::Disconnected => "Tap to connect".to_string(),
+        Status::Reconnecting => "Connection lost, retrying".to_string(),
         _ => "Please wait".to_string(),
     };
     let busy = matches!(st, Status::Connecting | Status::Disconnecting);
@@ -321,9 +365,15 @@ fn App() -> Element {
                 button {
                     class: "power",
                     disabled: busy,
-                    title: if st == Status::Connected { "Disconnect" } else { "Connect" },
+                    title: if matches!(st, Status::Connected | Status::Reconnecting) { "Disconnect" } else { "Connect" },
                     onclick: move |_| async move {
-                        if *status.peek() == Status::Connected { disconnect().await } else { connect().await }
+                        // Copied out first: a guard in the match scrutinee would stay borrowed
+                        // while connect() sets the status.
+                        let current = *status.peek();
+                        match current {
+                            Status::Connected | Status::Reconnecting => disconnect().await,
+                            _ => connect().await,
+                        }
                     },
                     Icon { d: POWER }
                 }

@@ -17,6 +17,14 @@ use crate::settings::Settings;
 
 pub const SOCKS_ADDR: &str = "127.0.0.1:9000";
 
+/// How often to check the SSH connection is alive; it counts as dead after 3 missed replies.
+/// Each check wakes a phone's mobile radio for a few seconds, so Android checks less often
+/// (still well inside the 2-5 minutes mobile networks keep idle connections open).
+#[cfg(target_os = "android")]
+const KEEPALIVE: Duration = Duration::from_secs(60);
+#[cfg(not(target_os = "android"))]
+const KEEPALIVE: Duration = Duration::from_secs(15);
+
 #[derive(Debug, Clone, PartialEq)]
 enum HostKeyCheck {
     Pending,
@@ -65,9 +73,19 @@ pub struct Started {
 
 impl Tunnel {
     pub async fn start(settings: &Settings) -> Result<Started> {
+        Self::start_at(settings, None).await
+    }
+
+    /// Connect again after the session dropped. Goes to the IP the first connection used:
+    /// with the full VPN up, looking the host name up again would go into the dead tunnel.
+    pub async fn reconnect(settings: &Settings, server_ip: IpAddr) -> Result<Tunnel> {
+        Ok(Self::start_at(settings, Some(server_ip)).await?.tunnel)
+    }
+
+    async fn start_at(settings: &Settings, server_ip: Option<IpAddr>) -> Result<Started> {
         let config = Arc::new(client::Config {
             nodelay: true,
-            keepalive_interval: Some(Duration::from_secs(15)),
+            keepalive_interval: Some(KEEPALIVE),
             keepalive_max: 3,
             ..Default::default()
         });
@@ -82,7 +100,11 @@ impl Tunnel {
         let connect = async {
             // Connect ourselves rather than via `client::connect` to learn the server's IP,
             // which the full VPN must route around the tunnel.
-            let stream = TcpStream::connect(addr).await.map_err(russh::Error::from)?;
+            let stream = match server_ip {
+                Some(ip) => TcpStream::connect((ip, settings.port)).await,
+                None => TcpStream::connect(addr).await,
+            }
+            .map_err(russh::Error::from)?;
             let _ = stream.set_nodelay(true);
             let server_ip = stream.peer_addr().map_err(russh::Error::from)?.ip();
             client::connect_stream(config, stream, handler).await.map(|s| (s, server_ip))
@@ -143,6 +165,8 @@ impl Tunnel {
 
     pub async fn stop(self) {
         self.listener.abort();
+        // Wait for the listener to be dropped, so a reconnect can bind the SOCKS port again.
+        let _ = self.listener.await;
         let _ = self.session.disconnect(Disconnect::ByApplication, "", "en").await;
     }
 }

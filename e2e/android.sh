@@ -15,8 +15,8 @@ LOG=$(mktemp)
 OUT=${E2E_OUT:-e2e-android}   # screenshot, UI dump and logcat land here on failure
 mkdir -p "$OUT"
 
-"$E2E" server 0.0.0.0:2222 2>"$LOG" &
-SERVER=$!
+start_server() { "$E2E" server 0.0.0.0:2222 2>>"$LOG" & SERVER=$!; }
+start_server
 fail() {
   echo "FAIL $*"
   echo "--- server log"; tail -20 "$LOG"
@@ -30,7 +30,12 @@ fail() {
   exit 1
 }
 pass() { echo "PASS $*"; }
-trap 'kill $SERVER 2>/dev/null || true' EXIT
+cleanup() {
+  kill $SERVER 2>/dev/null || true
+  adb shell dumpsys deviceidle unforce >/dev/null 2>&1 || true
+  adb shell dumpsys battery reset >/dev/null 2>&1 || true
+}
+trap cleanup EXIT
 
 vpn_up() { adb shell dumpsys connectivity | grep -q "VPN CONNECTED"; }
 wait_for() { # seconds, command...
@@ -136,6 +141,42 @@ adb shell cmd uimode night no >/dev/null; sleep 4
 vpn_up || fail "VPN dropped on a dark-mode switch"
 pass "VPN survives a dark-mode switch"
 
+# Screen locked, battery saver on, device in Doze: the VPN's SSH connection must survive and
+# still carry traffic (without the foreground service, the app's own network is cut).
+logins=$(grep -c "AUTH test accepted" "$LOG")
+adb shell dumpsys battery unplug
+adb shell settings put global low_power 1
+adb shell input keyevent KEYCODE_SLEEP
+adb shell dumpsys deviceidle force-idle >/dev/null
+sleep 75
+vpn_up || fail "VPN dropped while the phone was asleep"
+n=$(forwarded example.com:80)
+status=$(http_status example.com)
+[[ $status == *" 200 "* ]] || fail "HTTP through the VPN while asleep: '$status'"
+(($(forwarded example.com:80) > n)) || fail "request while asleep did not go through SSH"
+(($(grep -c "AUTH test accepted" "$LOG") == logins)) || fail "SSH connection dropped while asleep (it reconnected)"
+adb shell dumpsys deviceidle unforce >/dev/null
+adb shell settings put global low_power 0
+adb shell dumpsys battery reset
+adb shell input keyevent KEYCODE_WAKEUP
+adb shell wm dismiss-keyguard
+sleep 2
+pass "VPN and SSH connection survive screen lock, battery saver and Doze"
+
+# The SSH server goes away for a moment: the VPN stays up (traffic waits rather than leaking)
+# and the app logs in again once the server is back.
+kill $SERVER; wait $SERVER 2>/dev/null || true
+sleep 5
+vpn_up || fail "VPN dropped when the SSH connection did"
+adb shell pidof $PKG >/dev/null || fail "app crashed when the SSH connection dropped"
+start_server
+wait_for 60 bash -c "(( \$(grep -c 'AUTH test accepted' '$LOG') > $logins ))" || fail "app did not reconnect to SSH"
+n=$(forwarded example.com:80)
+status=$(http_status example.com)
+[[ $status == *" 200 "* ]] || fail "HTTP through the VPN after reconnecting: '$status'"
+(($(forwarded example.com:80) > n)) || fail "request after reconnecting did not go through SSH"
+pass "dropped SSH connection is re-established with the VPN kept up"
+
 adb shell input tap $POWER
 wait_for 20 bash -c '! adb shell dumpsys connectivity | grep -q "VPN CONNECTED"' || fail "VPN still up after disconnect"
 n=$(forwarded example.org:80)
@@ -145,11 +186,8 @@ status=$(http_status example.org)
 pass "disconnect removes the VPN, traffic goes direct"
 
 adb shell input tap $POWER
-wait_for 30 vpn_up || fail "reconnect: VPN did not come up"
-kill $SERVER; wait $SERVER 2>/dev/null || true
-wait_for 40 bash -c '! adb shell dumpsys connectivity | grep -q "VPN CONNECTED"' || fail "VPN still up after the SSH server died"
-adb shell pidof $PKG >/dev/null || fail "app crashed when the SSH connection dropped"
-pass "lost SSH connection is noticed and the VPN removed"
+wait_for 30 vpn_up || fail "connect again: VPN did not come up"
+pass "connects again"
 
 adb logcat -d | grep -q "FATAL EXCEPTION" && fail "crash in logcat"
 echo "ALL PASSED"
